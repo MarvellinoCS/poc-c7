@@ -9,6 +9,8 @@ struct MatItem: Identifiable {
         case emoji(String)
         case symbol(String, ShapeColor)
         case text(String)
+        case tape(TapeStyle)
+        case stroke(DrawStroke)
     }
 
     var id = UUID()
@@ -286,19 +288,51 @@ final class MatModel {
     private var history: [[MatItem]] = []
     private let store: MatStore?
     private var saveTask: Task<Void, Never>?
+    var pageID: UUID?
+    var onPersisted: ((UUID) -> Void)?
 
     init(persistent: Bool = true) {
         if persistent {
-            let store = MatStore()
+            let store = MatStore.shared
             self.store = store
-            if CommandLine.arguments.contains("-resetBoard") {
-                store.reset()
-            } else {
-                store.load(into: self)
-            }
+            store.loadGlobals(into: self)
         } else {
             store = nil
         }
+    }
+
+    func openPage(_ id: UUID) {
+        if pageID != nil {
+            saveNow()
+        }
+        saveTask?.cancel()
+        clearPage()
+        store?.loadPage(id, into: self)
+        pageID = id
+    }
+
+    func detachPage() {
+        saveTask?.cancel()
+        pageID = nil
+        clearPage()
+    }
+
+    private func clearPage() {
+        items = []
+        history = []
+        selection = nil
+        editingID = nil
+        touchOwner = nil
+        guides = []
+        sizes = [:]
+        formatOpen = false
+        background = .white
+        paper = .grid
+    }
+
+    func saveThumbnail(_ png: Data) {
+        guard let pageID else { return }
+        store?.saveThumbnail(png, for: pageID)
     }
 
     var signature: Int {
@@ -333,7 +367,10 @@ final class MatModel {
 
     func saveNow() {
         saveTask?.cancel()
-        store?.save(self)
+        store?.saveAll(self)
+        if let pageID {
+            onPersisted?(pageID)
+        }
     }
 
     var canUndo: Bool { !history.isEmpty }
@@ -383,6 +420,21 @@ final class MatModel {
         item.offset = CGSize(width: .random(in: -60...60), height: .random(in: -80...80))
         items.append(item)
         selection = item.id
+    }
+
+    func placeTape(_ style: TapeStyle) {
+        place(.tape(style))
+        if let index = items.indices.last {
+            items[index].rotation = .degrees(.random(in: -8...8))
+        }
+    }
+
+    func addStroke(_ canvasPoints: [CGPoint], canvas: CGSize, width: CGFloat, color: PenColor) {
+        guard let made = DrawStroke.make(from: canvasPoints, width: width, color: color) else { return }
+        checkpoint()
+        var item = MatItem(kind: .stroke(made.stroke))
+        item.offset = CGSize(width: made.center.x - canvas.width / 2, height: made.center.y - canvas.height / 2)
+        items.append(item)
     }
 
     func addText() {
@@ -489,28 +541,30 @@ final class MatModel {
         return false
     }
 
+    func contains(_ item: MatItem, point: CGPoint, canvas: CGSize, lift: (MatItem) -> CGFloat = { _ in 0 }) -> Bool {
+        guard let size = sizes[item.id] else { return false }
+        let center = CGPoint(
+            x: canvas.width / 2 + item.offset.width,
+            y: canvas.height / 2 + item.offset.height + lift(item)
+        )
+        let dx = point.x - center.x
+        let dy = point.y - center.y
+        let angle = -item.rotation.radians
+        let x = (dx * cos(angle) - dy * sin(angle)) / item.scale
+        let y = (dx * sin(angle) + dy * cos(angle)) / item.scale
+        let slop = 10 / max(item.scale, 0.3)
+        if case .stroke(let stroke) = item.kind {
+            return stroke.distance(to: CGPoint(x: x, y: y)) <= stroke.width / 2 + 14 / max(item.scale, 0.3)
+        }
+        return abs(x) <= size.width / 2 + slop && abs(y) <= size.height / 2 + slop
+    }
+
     func item(at point: CGPoint, canvas: CGSize, lift: (MatItem) -> CGFloat = { _ in 0 }) -> UUID? {
         var order = Array(items.reversed())
         if let editingID, let index = order.firstIndex(where: { $0.id == editingID }) {
             order.insert(order.remove(at: index), at: 0)
         }
-        for item in order {
-            guard let size = sizes[item.id] else { continue }
-            let center = CGPoint(
-                x: canvas.width / 2 + item.offset.width,
-                y: canvas.height / 2 + item.offset.height + lift(item)
-            )
-            let dx = point.x - center.x
-            let dy = point.y - center.y
-            let angle = -item.rotation.radians
-            let x = (dx * cos(angle) - dy * sin(angle)) / item.scale
-            let y = (dx * sin(angle) + dy * cos(angle)) / item.scale
-            let slop = 10 / max(item.scale, 0.3)
-            if abs(x) <= size.width / 2 + slop && abs(y) <= size.height / 2 + slop {
-                return item.id
-            }
-        }
-        return nil
+        return order.first { contains($0, point: point, canvas: canvas, lift: lift) }?.id
     }
 
     func touchBegan(_ id: UUID) {
@@ -563,6 +617,7 @@ struct MatItemView: View {
     var body: some View {
         content
             .padding(6)
+            .contentShape(hitShape)
             .onGeometryChange(for: CGSize.self) { $0.size } action: { onSize($0) }
             .overlay {
                 if isSelected {
@@ -601,9 +656,21 @@ struct MatItemView: View {
             }
     }
 
+    private var hitShape: AnyShape {
+        if case .stroke(let stroke) = item.kind {
+            let reach = StrokeStyle(lineWidth: stroke.width + 24, lineCap: .round, lineJoin: .round)
+            return AnyShape(stroke.path(offsetBy: 6).strokedPath(reach))
+        }
+        return AnyShape(Rectangle())
+    }
+
     @ViewBuilder
     private var content: some View {
         switch item.kind {
+        case .tape(let style):
+            TapeView(style: style)
+        case .stroke(let stroke):
+            StrokeView(stroke: stroke)
         case .sticker(let image):
             Image(uiImage: image)
                 .resizable()
@@ -663,6 +730,8 @@ struct MatView: View {
         case paper
         case sticker
         case deco
+        case washi
+        case draw
     }
 
     @Bindable var mat: MatModel
@@ -678,10 +747,13 @@ struct MatView: View {
     @State private var panTarget: UUID?
     @State private var pinchTarget: UUID?
     @State private var rotateTarget: UUID?
+    @State private var multiTarget: UUID?
     @State private var activeGestures = 0
     @State private var exported: ExportedMat?
     @State private var confirmingClear = false
     @State private var showingInspire = false
+    @State private var penColor = PenColor.black
+    @State private var penWidth: CGFloat = 5
     @State private var blockedRects: [String: CGRect] = [:]
 
     private let ink = Color(white: 0.12)
@@ -730,6 +802,8 @@ struct MatView: View {
             case "paper": panel = .paper
             case "sticker": panel = .sticker
             case "deco": panel = .deco
+            case "washi": panel = .washi
+            case "draw": panel = .draw
             default: break
             }
             if UserDefaults.standard.bool(forKey: "openInspire") {
@@ -759,6 +833,11 @@ struct MatView: View {
             }
         }
         .preferredColorScheme(.light)
+        .task(id: mat.signature) {
+            try? await Task.sleep(for: .seconds(1.5))
+            if !Task.isCancelled { saveThumbnail() }
+        }
+        .onDisappear { saveThumbnail() }
         .ignoresSafeArea(.keyboard, edges: .bottom)
         .overlay(alignment: .bottom) { editingChrome.ignoresSafeArea(.keyboard, edges: .bottom) }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
@@ -861,6 +940,7 @@ struct MatView: View {
                 .frame(width: geometry.size.width, height: geometry.size.height)
                 .background {
                     BoardGestures(
+                        isEnabled: panel != .draw,
                         blockedRects: Array(blockedRects.values),
                         onPan: handlePan,
                         onPinch: handlePinch,
@@ -874,6 +954,13 @@ struct MatView: View {
                 .onChange(of: geometry.size) { canvasSize = geometry.size }
                 .onChange(of: geometry.frame(in: .global).minY) {
                     canvasMinY = geometry.frame(in: .global).minY
+                }
+                .overlay {
+                    if panel == .draw {
+                        DrawLayer(color: penColor, width: penWidth) { points in
+                            mat.addStroke(points, canvas: geometry.size, width: penWidth, color: penColor)
+                        }
+                    }
                 }
         }
     }
@@ -912,7 +999,7 @@ struct MatView: View {
                     .zIndex(mat.editingID == item.id ? 1 : 0)
                     .accessibilityElement(children: .ignore)
                     .accessibilityIdentifier("item-\(mat.items.firstIndex(where: { $0.id == item.id }) ?? -1)")
-                    .accessibilityValue(item.readout)
+                    .accessibilityValue(item.readout + " sel=\(mat.selection == item.id ? 1 : 0)")
                 }
             }
         }
@@ -920,45 +1007,66 @@ struct MatView: View {
     }
 
     private var bottomBar: some View {
-        HStack(spacing: 0) {
-            tab("Paper", "square.grid.3x3", active: panel == .paper) { toggle(.paper) }
-            tab("Text", "textformat", active: false) {
-                panel = nil
-                mat.addText()
-            }
-            tab("Sticker", "face.smiling", active: panel == .sticker) { toggle(.sticker) }
-            tab("Deco", "sparkles", active: panel == .deco) { toggle(.deco) }
-            PhotosPicker(selection: $imageItem, matching: .images) {
-                tabLabel("Image", "photo", active: false)
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 0) {
+                tab("Paper", active: panel == .paper, action: { toggle(.paper) }) { HatchIcon() }
+                tab("Text", active: false, action: {
+                    panel = nil
+                    mat.addText()
+                }) { TextBoxIcon() }
+                PhotosPicker(selection: $imageItem, matching: .images) {
+                    tabLabel("Image", active: false) {
+                        Image(systemName: "photo").font(.system(size: 24))
+                    }
+                }
+                .accessibilityIdentifier("board-tab-image")
+                tab("Sticker", active: panel == .sticker, action: { toggle(.sticker) }) {
+                    Image(systemName: "face.smiling").font(.system(size: 24))
+                }
+                tab("Deco", active: panel == .deco, action: { toggle(.deco) }) {
+                    Image(systemName: "doc").font(.system(size: 24))
+                }
+                tab("Washi", active: panel == .washi, action: { toggle(.washi) }) { WashiIcon() }
+                tab("Draw", active: panel == .draw, action: { toggle(.draw) }) {
+                    Image(systemName: "pencil.tip").font(.system(size: 24))
+                }
             }
         }
         .frame(height: 64)
         .background(Color.white)
         .overlay(alignment: .top) { Divider() }
+        .accessibilityIdentifier("board-bar")
     }
 
     private func toggle(_ target: Panel) {
         panel = panel == target ? nil : target
+        if panel == .draw {
+            mat.finishEditing()
+            mat.selection = nil
+        }
     }
 
-    private func tab(_ title: String, _ symbol: String, active: Bool, action: @escaping () -> Void) -> some View {
+    private func tab<Icon: View>(
+        _ title: String,
+        active: Bool,
+        action: @escaping () -> Void,
+        @ViewBuilder icon: () -> Icon
+    ) -> some View {
         Button(action: action) {
-            tabLabel(title, symbol, active: active)
+            tabLabel(title, active: active, icon: icon)
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("board-tab-\(title.lowercased())")
     }
 
-    private func tabLabel(_ title: String, _ symbol: String, active: Bool) -> some View {
+    private func tabLabel<Icon: View>(_ title: String, active: Bool, @ViewBuilder icon: () -> Icon) -> some View {
         VStack(spacing: 4) {
-            Image(systemName: symbol)
-                .font(.system(size: 24))
+            icon()
                 .frame(height: 28)
-            Text(title).font(.system(size: 11))
+            Text(title).font(.system(size: 11, weight: active ? .semibold : .regular))
         }
         .foregroundStyle(active ? ink : muted)
-        .frame(maxWidth: .infinity)
-        .frame(height: 64)
+        .frame(width: 72, height: 64)
         .contentShape(Rectangle())
     }
 
@@ -1003,6 +1111,8 @@ struct MatView: View {
                 case .paper: paperPanel
                 case .sticker: stickerPanel
                 case .deco: decoPanel
+                case .washi: washiPanel
+                case .draw: drawPanel
                 }
             }
             .padding(12)
@@ -1077,6 +1187,59 @@ struct MatView: View {
                 }
             }
         }
+        .accessibilityIdentifier("panel-scroll")
+    }
+
+    private var washiPanel: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 14) {
+                ForEach(Array(TapeStyle.allCases.enumerated()), id: \.element) { index, style in
+                    Button { mat.placeTape(style) } label: {
+                        TapeView(style: style, width: 104)
+                            .padding(.vertical, 8)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("tape-\(index)")
+                }
+            }
+        }
+        .accessibilityIdentifier("panel-scroll")
+    }
+
+    private var drawPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                ForEach(PenColor.allCases) { pen in
+                    Button { penColor = pen } label: {
+                        Circle()
+                            .fill(pen.color)
+                            .frame(width: 28, height: 28)
+                            .overlay(
+                                Circle().strokeBorder(
+                                    Color.black.opacity(penColor == pen ? 0.85 : 0),
+                                    lineWidth: 2.5
+                                )
+                                .padding(-4)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("pen-\(pen.rawValue)")
+                }
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 14) {
+                Circle()
+                    .fill(penColor.color)
+                    .frame(width: max(penWidth, 4), height: max(penWidth, 4))
+                    .frame(width: 24, height: 24)
+                Slider(value: $penWidth, in: 2...22)
+                Button("Done") { panel = nil }
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(ink)
+                    .accessibilityIdentifier("draw-done")
+            }
+        }
+        .foregroundStyle(ink)
     }
 
     private var decoPanel: some View {
@@ -1099,6 +1262,7 @@ struct MatView: View {
                 }
             }
         }
+        .accessibilityIdentifier("panel-scroll")
     }
 
     private var coveredTop: CGFloat? {
@@ -1257,10 +1421,43 @@ struct MatView: View {
         mat.items[index].offset.height = height
     }
 
-    private func handlePinch(_ state: UIGestureRecognizer.State, _ factor: CGFloat, _ location: CGPoint) {
+    private func multiTouchTarget(centroid: CGPoint, first: CGPoint?) -> UUID? {
+        if let locked = multiTarget, mat.items.contains(where: { $0.id == locked }) {
+            return locked
+        }
+        let lift: (MatItem) -> CGFloat = { lift(for: $0) }
+        let points = [first, centroid].compactMap { $0 }
+        var chosen: UUID?
+        if let selected = mat.items.first(where: { $0.id == mat.selection }),
+           points.contains(where: { mat.contains(selected, point: $0, canvas: canvasSize, lift: lift) }) {
+            chosen = selected.id
+        }
+        if chosen == nil {
+            for point in points {
+                if let hit = mat.item(at: point, canvas: canvasSize, lift: lift) {
+                    chosen = hit
+                    break
+                }
+            }
+        }
+        chosen = chosen ?? mat.touchOwner ?? mat.selection
+        multiTarget = chosen
+        if let chosen, mat.selection != chosen {
+            mat.selection = chosen
+        }
+        return chosen
+    }
+
+    private func finishMultiTouchIfIdle() {
+        if pinchTarget == nil && rotateTarget == nil {
+            multiTarget = nil
+        }
+    }
+
+    private func handlePinch(_ state: UIGestureRecognizer.State, _ factor: CGFloat, _ location: CGPoint, _ first: CGPoint?) {
         switch state {
         case .began:
-            pinchTarget = target(at: location)
+            pinchTarget = multiTouchTarget(centroid: location, first: first)
             begin(pinchTarget)
             applyPinch(factor)
         case .changed:
@@ -1268,6 +1465,7 @@ struct MatView: View {
         default:
             end(pinchTarget)
             pinchTarget = nil
+            finishMultiTouchIfIdle()
         }
     }
 
@@ -1276,10 +1474,10 @@ struct MatView: View {
         mat.items[index].scale = min(max(mat.items[index].scale * factor, 0.3), 5)
     }
 
-    private func handleRotate(_ state: UIGestureRecognizer.State, _ angle: Angle, _ location: CGPoint) {
+    private func handleRotate(_ state: UIGestureRecognizer.State, _ angle: Angle, _ location: CGPoint, _ first: CGPoint?) {
         switch state {
         case .began:
-            rotateTarget = target(at: location)
+            rotateTarget = multiTouchTarget(centroid: location, first: first)
             begin(rotateTarget)
             applyRotation(angle)
         case .changed:
@@ -1287,6 +1485,7 @@ struct MatView: View {
         default:
             end(rotateTarget)
             rotateTarget = nil
+            finishMultiTouchIfIdle()
         }
     }
 
@@ -1304,6 +1503,18 @@ struct MatView: View {
         ]
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
         return UIImage(cgImage: image)
+    }
+
+    private func saveThumbnail() {
+        guard mat.pageID != nil, canvasSize.width > 0 else { return }
+        let renderer = ImageRenderer(
+            content: canvasContent(selectable: false)
+                .frame(width: canvasSize.width, height: canvasSize.height)
+        )
+        renderer.scale = 0.6
+        if let data = renderer.uiImage?.pngData() {
+            mat.saveThumbnail(data)
+        }
     }
 
     private func export() {
@@ -1472,10 +1683,11 @@ extension View {
 }
 
 struct BoardGestures: UIViewRepresentable {
+    let isEnabled: Bool
     let blockedRects: [CGRect]
     let onPan: (UIGestureRecognizer.State, CGSize, CGPoint) -> Void
-    let onPinch: (UIGestureRecognizer.State, CGFloat, CGPoint) -> Void
-    let onRotate: (UIGestureRecognizer.State, Angle, CGPoint) -> Void
+    let onPinch: (UIGestureRecognizer.State, CGFloat, CGPoint, CGPoint?) -> Void
+    let onRotate: (UIGestureRecognizer.State, Angle, CGPoint, CGPoint?) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -1571,17 +1783,17 @@ struct BoardGestures: UIViewRepresentable {
         }
 
         @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
-            parent.onPinch(recognizer.state, recognizer.scale, recognizer.location(in: canvas))
+            parent.onPinch(recognizer.state, recognizer.scale, recognizer.location(in: canvas), tracker.downPoint)
             recognizer.scale = 1
         }
 
         @objc private func handleRotation(_ recognizer: UIRotationGestureRecognizer) {
-            parent.onRotate(recognizer.state, Angle(radians: Double(recognizer.rotation)), recognizer.location(in: canvas))
+            parent.onRotate(recognizer.state, Angle(radians: Double(recognizer.rotation)), recognizer.location(in: canvas), tracker.downPoint)
             recognizer.rotation = 0
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-            guard let canvas else { return false }
+            guard parent.isEnabled, let canvas else { return false }
             guard canvas.bounds.contains(touch.location(in: canvas)) else { return false }
             let inWindow = touch.location(in: nil)
             return !parent.blockedRects.contains { $0.contains(inWindow) }

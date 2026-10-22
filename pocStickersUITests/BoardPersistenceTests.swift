@@ -37,9 +37,8 @@ final class BoardPersistenceTests: XCTestCase {
         app.terminate()
         app.launchArguments = []
         app.launch()
-        let journal = app.buttons["tab-journal"]
-        XCTAssertTrue(journal.waitForExistence(timeout: 15), "Journal tab not found on the Home screen after relaunch")
-        journal.tap()
+        XCTAssertTrue(app.buttons["tab-journal"].waitForExistence(timeout: 15), "Journal tab not found on the Home screen after relaunch")
+        app.openJournalPage()
 
         XCTAssertTrue(item(3).waitForExistence(timeout: 15), "text item missing after relaunch")
         XCTAssertFalse(item(4).exists, "unexpected extra item after relaunch")

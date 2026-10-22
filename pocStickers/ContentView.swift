@@ -112,6 +112,10 @@ struct ContentView: View {
     @GestureState private var twist = Angle.zero
     @GestureState private var panDrag = CGSize.zero
     @State private var mat = MatModel(persistent: !ContentView.usesTestBoard)
+    @State private var library = JournalLibrary(persistent: !ContentView.usesTestBoard)
+    @State private var journalFocusID: UUID?
+    @State private var journalZoomed = false
+    @State private var pagesJournalID: UUID?
     @State private var route = Route.home
     @State private var cameraReturn = Route.home
     @AppStorage("userName") private var userName = ""
@@ -123,6 +127,8 @@ struct ContentView: View {
     enum Route {
         case home
         case profile
+        case journals
+        case pages
         case board
         case camera
         case feelings
@@ -145,17 +151,46 @@ struct ContentView: View {
                         stickers: mat.stickers,
                         name: userName,
                         onWrite: write,
-                        onOpenJournal: { route = .board },
+                        onOpenJournal: { route = .journals },
                         onAddSticker: { openCamera(returningTo: .home) }
                     )
                     .overlay(alignment: .bottom) { tabBar(selected: .home) }
                 case .profile:
                     ProfileScreen(name: $userName, stickerCount: mat.stickers.count, itemCount: mat.items.count)
                         .overlay(alignment: .bottom) { tabBar(selected: .profile) }
+                case .journals:
+                    JournalsScreen(
+                        library: library,
+                        focusedID: $journalFocusID,
+                        zoomed: $journalZoomed,
+                        onOpenPage: openLatestPage,
+                        onShowPages: { id in
+                            pagesJournalID = id
+                            route = .pages
+                        }
+                    )
+                    .overlay(alignment: .bottom) {
+                        if !journalZoomed {
+                            tabBar(selected: .journal)
+                        }
+                    }
+                case .pages:
+                    if let journalID = pagesJournalID {
+                        PagesScreen(
+                            library: library,
+                            journalID: journalID,
+                            onBack: { route = .journals },
+                            onOpen: { openPage($0, in: journalID) },
+                            onNew: { openNewPage(in: journalID) }
+                        )
+                    }
                 case .board:
                     MatView(
                         mat: mat,
-                        onBack: { route = .home },
+                        onBack: {
+                            mat.saveNow()
+                            route = .journals
+                        },
                         onNewSticker: { openCamera(returningTo: .board) }
                     )
                 case .feelings:
@@ -190,9 +225,40 @@ struct ContentView: View {
         }
         .preferredColorScheme(model.isIdle && route != .camera ? .light : nil)
         .task {
+            mat.onPersisted = { library.touch(pageID: $0) }
+            library.onPagesRemoved = { ids in
+                if let current = mat.pageID, ids.contains(current) {
+                    mat.detachPage()
+                }
+            }
+            let extra = UserDefaults.standard.integer(forKey: "moreJournals")
+            if extra > 0 {
+                let titles = ["Travel Diary", "Gratitude Log", "Dream Notes"]
+                for index in 0..<min(extra, titles.count) {
+                    var journal = library.journal(library.addJournal())!
+                    journal.title = titles[index]
+                    library.update(journal)
+                }
+                library.setActive(library.journals[0].id)
+                journalFocusID = library.journals[0].id
+            }
+            if UserDefaults.standard.bool(forKey: "zoomJournal") {
+                journalFocusID = library.activeJournal?.id
+                journalZoomed = true
+            }
             switch UserDefaults.standard.string(forKey: "route") {
             case "profile": route = .profile
-            case "board": route = .board
+            case "pages":
+                pagesJournalID = library.activeJournal?.id
+                if let id = pagesJournalID {
+                    _ = library.addPage(to: id)
+                    _ = library.addPage(to: id)
+                }
+                route = .pages
+            case "journals": route = .journals
+            case "board":
+                ensureOpenPage()
+                route = .board
             case "feelings": route = .feelings
             case "needs": route = .needs
             case "guiding": route = .guiding
@@ -395,7 +461,40 @@ struct ContentView: View {
         .lineLimit(1)
     }
 
+    private func ensureOpenPage() {
+        if let current = mat.pageID, library.journals.contains(where: { $0.pageIDs.contains(current) }) {
+            return
+        }
+        let journalID = library.activeJournal?.id ?? library.journals[0].id
+        let pageID = library.lastPage(of: journalID) ?? library.addPage(to: journalID)
+        mat.openPage(pageID)
+        journalFocusID = journalID
+        journalZoomed = true
+    }
+
+    private func openLatestPage(_ journalID: UUID) {
+        library.setActive(journalID)
+        let pageID = library.lastPage(of: journalID) ?? library.addPage(to: journalID)
+        openPage(pageID, in: journalID)
+    }
+
+    private func openPage(_ pageID: UUID, in journalID: UUID) {
+        library.setActive(journalID)
+        journalFocusID = journalID
+        journalZoomed = true
+        if mat.pageID != pageID {
+            mat.openPage(pageID)
+        }
+        route = .board
+    }
+
+    private func openNewPage(in journalID: UUID) {
+        let pageID = library.addPage(to: journalID)
+        openPage(pageID, in: journalID)
+    }
+
     private func seedBoard() {
+        ensureOpenPage()
         if let image = UIImage(named: "testObject") {
             mat.addSticker(image)
         }
@@ -411,6 +510,12 @@ struct ContentView: View {
         for index in mat.items.indices where index < spots.count {
             mat.items[index].offset = spots[index]
         }
+        if CommandLine.arguments.contains("-overlap"), let first = mat.items.first {
+            mat.place(.text("TOP"))
+            if let last = mat.items.indices.last {
+                mat.items[last].offset = first.offset
+            }
+        }
         mat.selection = nil
         route = .board
     }
@@ -419,7 +524,7 @@ struct ContentView: View {
         HomeTabBar(selected: selected) { tab in
             switch tab {
             case .home: route = .home
-            case .journal: route = .board
+            case .journal: route = .journals
             case .profile: route = .profile
             }
         }
@@ -447,6 +552,11 @@ struct ContentView: View {
     }
 
     private func finishGuides(_ questions: [String], feeling: Feeling?, need: Need?, usedModel: Bool) {
+        let journalID = library.activeJournal?.id ?? library.journals[0].id
+        let pageID = library.addPage(to: journalID)
+        mat.openPage(pageID)
+        journalFocusID = journalID
+        journalZoomed = true
         mat.recordGuides(questions, feeling: feeling, need: need, usedModel: usedModel)
         mat.addText()
         if let id = mat.selection {
@@ -470,6 +580,7 @@ struct ContentView: View {
 
     private func finishSticker() async {
         guard model.foundSubject, let image = await model.trimmedSticker() else { return }
+        ensureOpenPage()
         mat.addSticker(image)
         retake()
         route = .board

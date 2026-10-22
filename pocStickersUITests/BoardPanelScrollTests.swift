@@ -24,7 +24,7 @@ final class BoardPanelScrollTests: XCTestCase {
         let opener = app.buttons[tab]
         XCTAssertTrue(opener.waitForExistence(timeout: 10), "\(tab) not found")
         opener.tap()
-        let panel = app.scrollViews.firstMatch
+        let panel = app.scrollViews["panel-scroll"]
         XCTAssertTrue(panel.waitForExistence(timeout: 10), "panel did not open")
         let before = (0..<4).map(readout)
         panel.swipeLeft()

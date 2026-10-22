@@ -65,16 +65,16 @@ final class GuidesFlowTests: XCTestCase {
     func testInspireMeShowsEmptyStateThenHistory() {
         app.launchArguments = ["-resetBoard"]
         app.launch()
-        app.buttons["tab-journal"].tap()
+        app.openJournalPage()
         let inspire = app.buttons["inspire"]
         XCTAssertTrue(inspire.waitForExistence(timeout: 10), "board has no Inspire Me button")
         inspire.tap()
         XCTAssertTrue(app.staticTexts["inspire-empty"].waitForExistence(timeout: 10), "empty state missing")
         app.buttons["inspire-close"].tap()
-        app.buttons["board-back"].tap()
+        app.goHomeFromBoard()
 
         runFlow(feeling: "sad", need: "untangle")
-        app.buttons["board-back"].tap()
+        app.goHomeFromBoard()
         runFlow(feeling: "happy", need: "understand")
 
         inspire.tap()
@@ -98,9 +98,8 @@ final class GuidesFlowTests: XCTestCase {
         app.terminate()
         app.launchArguments = []
         app.launch()
-        let journal = app.buttons["tab-journal"]
-        XCTAssertTrue(journal.waitForExistence(timeout: 15))
-        journal.tap()
+        XCTAssertTrue(app.buttons["tab-journal"].waitForExistence(timeout: 15))
+        app.openJournalPage()
         app.buttons["inspire"].tap()
         XCTAssertTrue(app.buttons["inspire-0-0"].waitForExistence(timeout: 10), "history did not survive relaunch")
     }
